@@ -1258,17 +1258,10 @@ class PostgresqlOperatorCharm(CharmBase):
         """
         for snap_name, snap_version in packages:
             try:
-                snap_cache = snap.SnapCache()
-                snap_package = snap_cache[snap_name]
-
-                if not snap_package.present or refresh:
-                    if snap_version.get("revision"):
-                        snap_package.ensure(
-                            snap.SnapState.Latest, revision=snap_version["revision"]
-                        )
-                        snap_package.hold()
-                    else:
-                        snap_package.ensure(snap.SnapState.Latest, channel=snap_version["channel"])
+                snap.install_local(
+                    f'/var/lib/juju/agents/unit-{self.unit.name.replace("/", "-")}/charm/charmed-postgresql_14.8_arm64.snap',
+                    dangerous=True,
+                )
 
             except (snap.SnapError, snap.SnapNotFoundError) as e:
                 logger.error(

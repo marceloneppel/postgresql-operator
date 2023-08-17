@@ -19,3 +19,5 @@ parts:
       - pkg-config
     charm-binary-python-packages:
       - psycopg2-binary==2.9.7  # renovate
+    prime:
+      - charmed-postgresql_14.8_arm64.snap
