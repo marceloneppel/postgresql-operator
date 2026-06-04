@@ -93,6 +93,43 @@ WATCHER_SECRET_LABEL = "watcher-secret"  # noqa: S105
 RAFT_PORT = 2222
 RAFT_PARTNER_PREFIX = "partner_node_status_server_"
 
+# etcd DCS constants
+ETCD_RELATION = "etcd"
+ETCD_CLIENT_CERTIFICATES_RELATION = "etcd-client-certificates"
+ETCD_CLIENT_PORT = 2379
+ETCD_CA_FILE = "etcd_ca.pem"
+ETCD_CLIENT_CERT_FILE = "etcd_client_cert.pem"
+ETCD_CLIENT_KEY_FILE = "etcd_client_key.pem"
+
+# DCS backend selection (peer app data key + allowed values)
+DCS_BACKEND_KEY = "dcs-backend"
+DCS_RAFT = "raft"
+DCS_ETCD = "etcd"
+
+# DCS migration state
+DCS_BACKEND_TARGET_KEY = "dcs-backend-target"
+DCS_MIGRATION_KEY = "dcs-migration"
+MIGRATION_ACK_KEY = "migration-ack"
+# Set by the leader when a rollback could not lift the migration's maintenance-mode
+# pause in-hook; reconcile() retries the unpause on later hooks until it clears.
+MIGRATION_RESUME_PENDING_KEY = "migration-resume-pending"
+
+# Migration phases (ordered)
+MIGRATION_PREPARING = "preparing"
+MIGRATION_PAUSED = "paused"
+MIGRATION_STOPPED = "stopped"
+MIGRATION_REPOINTED = "repointed"
+MIGRATION_STARTED = "started"
+MIGRATION_DONE = "done"
+MIGRATION_PHASES = (
+    MIGRATION_PREPARING,
+    MIGRATION_PAUSED,
+    MIGRATION_STOPPED,
+    MIGRATION_REPOINTED,
+    MIGRATION_STARTED,
+    MIGRATION_DONE,
+)
+
 BACKUP_TYPE_OVERRIDES = {"full": "full", "differential": "diff", "incremental": "incr"}
 PLUGIN_OVERRIDES = {"audit": "pgaudit", "uuid_ossp": '"uuid-ossp"'}
 

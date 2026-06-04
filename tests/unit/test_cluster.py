@@ -26,6 +26,10 @@ from cluster import (
     SwitchoverNotSyncError,
 )
 from constants import (
+    DCS_RAFT,
+    ETCD_CA_FILE,
+    ETCD_CLIENT_CERT_FILE,
+    ETCD_CLIENT_KEY_FILE,
     PATRONI_CONF_PATH,
     PATRONI_LOGS_PATH,
     POSTGRESQL_DATA_PATH,
@@ -312,6 +316,16 @@ def test_render_patroni_yml_file(peers_ips, patroni):
             patroni_password=patroni_password,
             instance_password_encryption="scram-sha-256",
             slots={},
+            # DCS seam vars (raft-mode defaults); etcd filename vars are always present.
+            dcs_backend=DCS_RAFT,
+            patroni_namespace="/db/",
+            etcd_hosts=[],
+            etcd_prefix="",
+            etcd_username="",
+            etcd_password="",
+            etcd_ca_file=ETCD_CA_FILE,
+            etcd_client_cert_file=ETCD_CLIENT_CERT_FILE,
+            etcd_client_key_file=ETCD_CLIENT_KEY_FILE,
         )
 
         # Patch the `open` method with our mock.
@@ -328,6 +342,191 @@ def test_render_patroni_yml_file(peers_ips, patroni):
             expected_content,
             0o600,
         )
+
+
+def test_render_patroni_yml_passes_dcs_vars(harness, patroni):
+    """render_patroni_yml_file feeds the real DCS seam vars into the template."""
+    from unittest.mock import PropertyMock, patch
+
+    captured = {}
+
+    class _T:
+        def __init__(self, text):
+            self._text = text
+
+        def render(self, **kwargs):
+            captured.update(kwargs)
+            return "rendered"
+
+    with (
+        patch("cluster.Template", _T),
+        patch("cluster.render_file"),
+        patch(
+            "relations.async_replication.PostgreSQLAsyncReplication.get_partner_addresses",
+            return_value=[],
+        ),
+        patch("charm.Patroni.get_postgresql_version", return_value="16.0"),
+        patch(
+            "charm.PostgresqlOperatorCharm.listen_ips",
+            new_callable=PropertyMock,
+            return_value=["1.1.1.1"],
+        ),
+    ):
+        patroni.render_patroni_yml_file()
+
+    # The real DCSBackend.template_vars() flows through: with no etcd relation the
+    # default backend is raft and the etcd host/prefix vars are empty.
+    assert captured["dcs_backend"] == "raft"
+    assert captured["etcd_hosts"] == []
+    assert captured["etcd_prefix"] == ""
+
+
+def test_render_patroni_yml_etcd_backend():
+    """Etcd backend renders etcd3 block and omits the raft block."""
+    from jinja2 import Template
+
+    with open("templates/patroni.yml.j2") as f:
+        template = Template(f.read())
+
+    rendered = template.render(
+        conf_path="/etc/patroni",
+        scope="postgresql",
+        patroni_namespace="/postgresql/abc/",
+        member_name="postgresql-0",
+        self_ip="1.1.1.1",
+        log_path="/logs",
+        postgresql_log_path="/pglogs",
+        data_path="/data",
+        listen_ips=["1.1.1.1"],
+        superuser="operator",
+        superuser_password="x",
+        replication_password="x",
+        rewind_user="rewind",
+        rewind_password="x",
+        patroni_password="x",
+        version="16",
+        synchronous_node_count=1,
+        maximum_lag_on_failover=1048576,
+        connectivity=True,
+        is_creating_backup=False,
+        enable_ldap=False,
+        enable_tls=False,
+        partner_addrs=[],
+        peers_ips=set(),
+        extra_replication_endpoints=set(),
+        pgbackrest_configuration_file="/pgbackrest.conf",
+        enable_pgbackrest_archiving=False,
+        restoring_backup=False,
+        primary_cluster_endpoint=None,
+        stanza=None,
+        restore_stanza=None,
+        backup_id=None,
+        pitr_target=None,
+        restore_timeline=None,
+        restore_to_latest=False,
+        pg_parameters=None,
+        user_databases_map={},
+        slots={},
+        instance_password_encryption="scram-sha-256",
+        ldap_parameters="",
+        raft_password="x",
+        watcher=None,
+        # DCS seam vars:
+        dcs_backend="etcd",
+        etcd_hosts=["10.0.0.1:2379", "10.0.0.2:2379"],
+        etcd_prefix="/postgresql/abc/",
+        etcd_username="postgresql",
+        etcd_password="s3cr3tpw",
+        etcd_ca_file="etcd_ca.pem",
+        etcd_client_cert_file="etcd_client_cert.pem",
+        etcd_client_key_file="etcd_client_key.pem",
+    )
+
+    assert "etcd3:" in rendered
+    assert "raft:" not in rendered
+    assert "10.0.0.1:2379" in rendered
+    assert "10.0.0.2:2379" in rendered
+    assert "namespace: /postgresql/abc/" in rendered
+    assert "/etc/patroni/etcd_ca.pem" in rendered
+    assert "/etc/patroni/etcd_client_cert.pem" in rendered
+    assert "/etc/patroni/etcd_client_key.pem" in rendered
+
+    # The whole rendered file must be valid YAML and the etcd3 block must carry the
+    # username/password used for token auth through the gRPC gateway. Patroni's etcd3
+    # backend ignores an ``etcd3.namespace`` key, so the keyspace is carried by the
+    # top-level ``namespace`` instead (which must match the granted RBAC prefix).
+    import yaml
+
+    parsed = yaml.safe_load(rendered)
+    assert parsed["namespace"] == "/postgresql/abc/"
+    assert "namespace" not in parsed["etcd3"]
+    assert parsed["etcd3"]["username"] == "postgresql"
+    assert parsed["etcd3"]["password"] == "s3cr3tpw"
+    assert parsed["etcd3"]["hosts"] == ["10.0.0.1:2379", "10.0.0.2:2379"]
+
+
+def test_render_patroni_yml_raft_backend_default():
+    """Without dcs_backend == etcd, the raft block renders and etcd3 does not."""
+    from jinja2 import Template
+
+    with open("templates/patroni.yml.j2") as f:
+        template = Template(f.read())
+
+    rendered = template.render(
+        conf_path="/etc/patroni",
+        scope="postgresql",
+        patroni_namespace="/db/",
+        member_name="postgresql-0",
+        self_ip="1.1.1.1",
+        log_path="/logs",
+        postgresql_log_path="/pglogs",
+        data_path="/data",
+        listen_ips=["1.1.1.1"],
+        superuser="operator",
+        superuser_password="x",
+        replication_password="x",
+        rewind_user="rewind",
+        rewind_password="x",
+        patroni_password="x",
+        version="16",
+        synchronous_node_count=1,
+        maximum_lag_on_failover=1048576,
+        connectivity=True,
+        is_creating_backup=False,
+        enable_ldap=False,
+        enable_tls=False,
+        partner_addrs=[],
+        peers_ips=set(),
+        extra_replication_endpoints=set(),
+        pgbackrest_configuration_file="/pgbackrest.conf",
+        enable_pgbackrest_archiving=False,
+        restoring_backup=False,
+        primary_cluster_endpoint=None,
+        stanza=None,
+        restore_stanza=None,
+        backup_id=None,
+        pitr_target=None,
+        restore_timeline=None,
+        restore_to_latest=False,
+        pg_parameters=None,
+        user_databases_map={},
+        slots={},
+        instance_password_encryption="scram-sha-256",
+        ldap_parameters="",
+        raft_password="raftpw",
+        watcher=None,
+        dcs_backend="raft",
+        etcd_hosts=[],
+        etcd_prefix="",
+        etcd_ca_file="etcd_ca.pem",
+        etcd_client_cert_file="etcd_client_cert.pem",
+        etcd_client_key_file="etcd_client_key.pem",
+    )
+
+    assert "raft:" in rendered
+    assert "etcd3:" not in rendered
+    assert "password: raftpw" in rendered
+    assert "namespace: /db/" in rendered
 
 
 def test_start_patroni(peers_ips, patroni):
@@ -422,6 +621,24 @@ def test_switchover(peers_ips, patroni):
             assert False
 
 
+def test_pause_patches_patroni_config(patroni):
+    from unittest.mock import patch
+
+    with patch("cluster.requests.patch") as req:
+        req.return_value.status_code = 200
+        patroni.pause()
+        assert req.call_args.kwargs["json"] == {"pause": True}
+
+
+def test_resume_patches_patroni_config(patroni):
+    from unittest.mock import patch
+
+    with patch("cluster.requests.patch") as req:
+        req.return_value.status_code = 200
+        patroni.resume()
+        assert req.call_args.kwargs["json"] == {"pause": False}
+
+
 def test_update_synchronous_node_count(peers_ips, patroni):
     with (
         patch("cluster.stop_after_delay", return_value=stop_after_delay(0)) as _wait_fixed,
@@ -446,6 +663,51 @@ def test_update_synchronous_node_count(peers_ips, patroni):
         with pytest.raises(RetryError):
             patroni.update_synchronous_node_count()
             assert False
+
+
+@pytest.mark.parametrize(
+    ("members_ips", "node_count", "config_strict", "expected_strict"),
+    [
+        # Bootstrap: only the leader is a member, count is 2 -> strict must stay off.
+        ('["1.1.1.1"]', 2, True, False),
+        # Mid scale-up: leader + 1 member, count 2 -> still off (the deadlock guard).
+        ('["1.1.1.1", "2.2.2.2"]', 2, True, False),
+        # Full membership: leader + 2 members, count 2 -> strict on.
+        ('["1.1.1.1", "2.2.2.2", "3.3.3.3"]', 2, True, True),
+        # Two-unit cluster, count 1 -> strict on.
+        ('["1.1.1.1", "2.2.2.2"]', 1, True, True),
+        # Operator disabled strict via config -> stays off regardless of membership.
+        ('["1.1.1.1", "2.2.2.2", "3.3.3.3"]', 2, False, False),
+        # Single-unit cluster, count 0 -> strict off.
+        ('["1.1.1.1"]', 0, True, False),
+    ],
+)
+def test_synchronous_configuration_strict_guard(
+    harness, patroni, members_ips, node_count, config_strict, expected_strict
+):
+    with (
+        patch(
+            "cluster.Patroni._synchronous_node_count",
+            new_callable=PropertyMock,
+            return_value=node_count,
+        ),
+        patch.object(
+            type(harness.charm),
+            "app_peer_data",
+            new_callable=PropertyMock,
+            return_value={"members_ips": members_ips},
+        ),
+        patch.object(
+            type(harness.charm),
+            "config",
+            new_callable=PropertyMock,
+            return_value=MagicMock(synchronous_mode_strict=config_strict),
+        ),
+    ):
+        config = patroni.synchronous_configuration
+
+    assert config["synchronous_node_count"] == node_count
+    assert config["synchronous_mode_strict"] is expected_strict
 
 
 def test_set_max_timelines_history(peers_ips, patroni):
@@ -870,6 +1132,20 @@ def test_remove_raft_data(patroni):
         assert _psutil.process_iter.call_count == 2
         _psutil.process_iter.assert_any_call(["name"])
         _rmtree.assert_called_once_with(Path(f"{PATRONI_CONF_PATH}/raft"))
+
+
+def test_remove_raft_journals(patroni):
+    with (
+        patch("cluster.Patroni.stop_patroni") as _stop_patroni,
+        patch("shutil.rmtree") as _rmtree,
+        patch("pathlib.Path.is_dir", return_value=True),
+        patch("pathlib.Path.exists", return_value=True),
+    ):
+        patroni.remove_raft_journals()
+
+        # Journals are removed but Patroni is left running (migration-commit path).
+        _rmtree.assert_called_once_with(Path(f"{PATRONI_CONF_PATH}/raft"))
+        _stop_patroni.assert_not_called()
 
 
 def test_reinitialise_raft_data(patroni):

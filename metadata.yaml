@@ -78,6 +78,14 @@ requires:
     interface: ldap
     limit: 1
     optional: true
+  etcd:
+    interface: etcd_client
+    limit: 1
+    optional: true
+  etcd-client-certificates:
+    interface: tls-certificates
+    limit: 1
+    optional: true
   tracing:
     interface: tracing
     limit: 1

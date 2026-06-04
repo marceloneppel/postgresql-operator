@@ -41,6 +41,13 @@ def charm():
     return f"./postgresql_ubuntu@24.04-{architecture.architecture}.charm"
 
 
+@pytest.fixture(scope="session")
+def etcd_charm():
+    # Locally-packed patched charmed-etcd for the DCS validation run (adds password support +
+    # CN-less username derivation). Point ETCD_CHARM at the packed .charm artifact.
+    return os.environ["ETCD_CHARM"]
+
+
 def get_cloud_config(cloud: str) -> tuple[dict[str, str], dict[str, str]] | None:
     # Define some configurations and credentials.
     if cloud == AWS:

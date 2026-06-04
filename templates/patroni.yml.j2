@@ -8,7 +8,7 @@
 
 # Name of the cluster.
 scope: {{ scope }}
-namespace: /db/
+namespace: {{ patroni_namespace }}
 name: {{ member_name }}
 
 log:
@@ -33,6 +33,23 @@ restapi:
 ctl:
   cacert: {{ conf_path }}/peer_ca.pem
 
+{% if dcs_backend == 'etcd' %}
+etcd3:
+  hosts:
+  {% for host in etcd_hosts -%}
+  - {{ host }}
+  {% endfor %}
+  protocol: https
+  cacert: {{ conf_path }}/{{ etcd_ca_file }}
+  cert: {{ conf_path }}/{{ etcd_client_cert_file }}
+  key: {{ conf_path }}/{{ etcd_client_key_file }}
+  {% if etcd_username -%}
+  username: {{ etcd_username }}
+  {% endif -%}
+  {% if etcd_password -%}
+  password: {{ etcd_password }}
+  {% endif -%}
+{% else %}
 raft:
   data_dir: {{ conf_path }}/raft
   self_addr: '{{ self_ip }}:2222'
@@ -46,6 +63,7 @@ raft:
   {%- if watcher %}
   - {{ watcher }}
   {% endif %}
+{% endif %}
 
 bootstrap:
   dcs:
