@@ -106,6 +106,10 @@ from constants import (
     DATABASE,
     DATABASE_DEFAULT_NAME,
     DATABASE_PORT,
+    DCS_BACKEND_KEY,
+    DCS_ETCD,
+    ETCD_CLIENT_CERTIFICATES_RELATION,
+    ETCD_RELATION,
     METRICS_PORT,
     MONITORING_PASSWORD_KEY,
     MONITORING_SNAP_SERVICE,
@@ -135,8 +139,11 @@ from constants import (
     UPDATE_CERTS_BIN_PATH,
     USER_PASSWORD_KEY,
 )
+from dcs import DCSBackend
 from ldap import PostgreSQLLDAP
+from migration import DCSMigration
 from relations.async_replication import PostgreSQLAsyncReplication
+from relations.etcd import PostgreSQLEtcd
 from relations.postgresql_provider import PostgreSQLProvider
 from relations.tls import TLS
 from relations.watcher import PostgreSQLWatcherRelation
@@ -341,6 +348,7 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         self.framework.observe(self.on[PEER].relation_departed, self._on_peer_relation_departed)
         self.framework.observe(self.on.start, self._on_start)
         self.framework.observe(self.on.promote_to_primary_action, self._on_promote_to_primary)
+        self.framework.observe(self.on.migrate_dcs_to_etcd_action, self._on_migrate_dcs_to_etcd)
         self.framework.observe(self.on.update_status, self._on_update_status)
         self.framework.observe(self.on.secret_remove, self._on_secret_remove)
         # Do not use collect status events elsewhere—otherwise ops will prioritize statuses
@@ -359,6 +367,13 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         self.tls_transfer = TLSTransfer(self, PEER)
         self.async_replication = PostgreSQLAsyncReplication(self)
         self.watcher_offer = PostgreSQLWatcherRelation(self)
+        self.etcd = PostgreSQLEtcd(self)
+        self.dcs = DCSBackend(self)
+        self.migration = DCSMigration(self)
+        self.framework.observe(self.etcd.on_etcd_ready, self._on_etcd_ready)
+        self.framework.observe(
+            self.etcd.on_etcd_endpoints_changed, self._on_etcd_endpoints_changed
+        )
         # self.logical_replication = PostgreSQLLogicalReplication(self)
         self.restart_manager = RollingOpsManager(
             charm=self, relation="restart", callback=self._restart
@@ -391,7 +406,14 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             else:
                 self.refresh.next_unit_allowed_to_refresh = True
 
-        self._observer.start_observer()
+        # Skip respawning the topology observer mid-migration: the `stopped`/`repointed`
+        # phases intentionally stop Patroni, so the observer would crash on an unreachable
+        # REST API and this unconditional __init__ call would respawn it every hook,
+        # rewriting observer-pid to peer data and storming peer-relation-changed -- which
+        # starves the leader's phase advancement. The migration STOPPED phase stops the
+        # observer; reconcile() restarts the normal flow once the cutover completes.
+        if not self.migration.in_progress:
+            self._observer.start_observer()
         self._rotate_logs.start_log_rotation()
         self._grafana_agent = COSAgentProvider(
             self,
@@ -963,19 +985,12 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
 
     def _on_peer_relation_changed(self, event: HookEvent):
         """Reconfigure cluster members when something changes."""
+        if self.migration.reconcile():
+            return
         if not self._peer_relation_changed_checks(event):
             return
 
-        # Update the list of the cluster members in the replicas to make them know each other.
-        try:
-            # Update the members of the cluster in the Patroni configuration on this unit.
-            self.update_config()
-        except RetryError:
-            self.set_unit_status(BlockedStatus("failed to update cluster members on member"))
-            return
-        except ValueError as e:
-            self.set_unit_status(BlockedStatus("Configuration Error. Please check the logs"))
-            logger.error("Invalid configuration: %s", str(e))
+        if not self._update_config_or_block():
             return
 
         # Should not override a blocked status
@@ -1024,6 +1039,22 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             self.async_replication.update_async_replication_data()
 
         self._update_new_unit_status()
+
+    # Split off into separate function, because of complexity _on_peer_relation_changed
+    def _update_config_or_block(self) -> bool:
+        """Update this unit's Patroni config; block and return False on failure."""
+        # Update the list of the cluster members in the replicas to make them know each other.
+        try:
+            # Update the members of the cluster in the Patroni configuration on this unit.
+            self.update_config()
+        except RetryError:
+            self.set_unit_status(BlockedStatus("failed to update cluster members on member"))
+            return False
+        except ValueError as e:
+            self.set_unit_status(BlockedStatus("Configuration Error. Please check the logs"))
+            logger.error("Invalid configuration: %s", str(e))
+            return False
+        return True
 
     # Split off into separate function, because of complexity _on_peer_relation_changed
     def _handle_s3_initialization(self, event: HookEvent) -> bool:
@@ -1671,6 +1702,11 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         if not self.get_secret(UNIT_SCOPE, "internal-cert"):
             self.tls.generate_internal_peer_cert()
 
+        # Gate bootstrap on DCS readiness (etcd, when related).
+        if not self._dcs_ready_to_bootstrap():
+            event.defer()
+            return
+
         self.unit_peer_data.update({"ip": self._unit_ip})
 
         # Open port
@@ -1686,7 +1722,13 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
             self._restart_services_after_reboot()
             return
 
-        # Bootstrap the cluster in the leader unit.
+        # Bootstrap the cluster in the leader unit. Record the chosen DCS backend (etcd
+        # when related and ready) and render the matching config BEFORE bootstrap, since
+        # bootstrap_cluster() does not re-render and would otherwise start Patroni on the
+        # stale default Raft config -- which then deadlocks waiting for a Raft quorum the
+        # not-yet-started replicas can't form.
+        self._record_active_dcs_backend()
+        self.update_config()
         self._start_primary(event)
         self._restart_services_after_reboot()
 
@@ -1982,6 +2024,18 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         else:
             event.fail("Scope should be either cluster or unit")
 
+    def _on_migrate_dcs_to_etcd(self, event) -> None:
+        """Start a Raft->etcd DCS migration (leader-coordinated)."""
+        if not self.unit.is_leader():
+            event.fail("This action must run on the leader unit.")
+            return
+        ok, reason = self.migration.check_preconditions()
+        if not ok:
+            event.fail(f"Preconditions not met: {reason}")
+            return
+        self.migration.begin()
+        event.set_results({"status": "migration-started"})
+
     def promote_primary_unit(self, event: ActionEvent) -> None:
         """Handles promote to primary for unit scope."""
         if event.params.get("force"):
@@ -2008,6 +2062,8 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
 
     def _on_update_status(self, _) -> None:
         """Update the unit status message and users list in the database."""
+        if self.migration.reconcile():
+            return
         if not self._can_run_on_update_status():
             return
 
@@ -2186,7 +2242,12 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
                 or self.is_standby_leader
             ):
                 danger_state = ""
-                if not self._patroni.has_raft_quorum():
+                # The read-only danger state signals Raft quorum loss; it has no
+                # meaning on etcd, where Patroni demotes a leader that loses the etcd
+                # lock (so get_primary would no longer point here). Probing the absent
+                # Raft endpoint on etcd always fails and would mislabel a healthy
+                # primary as read-only.
+                if self.dcs.is_raft and not self._patroni.has_raft_quorum():
                     danger_state = " (read-only)"
                 elif len(self._patroni.get_running_cluster_members()) < self.app.planned_units():
                     danger_state = " (degraded)"
@@ -3066,6 +3127,63 @@ class PostgresqlOperatorCharm(TypedCharmBase[CharmConfig]):
         finally:
             if connection:
                 connection.close()
+
+    def _on_etcd_ready(self, event) -> None:
+        """Etcd became usable as the DCS — (re)render config and (re)start if needed."""
+        self.update_config()
+        if not self.is_cluster_initialised:
+            # Let the deferred start event proceed now that the DCS is ready.
+            self.on.start.emit()
+
+    def _on_etcd_endpoints_changed(self, event) -> None:
+        """Etcd endpoints changed — re-render hosts and reload Patroni (non-disruptive)."""
+        if self.etcd.write_tls_files():
+            self.update_config()
+            # A fresh unit can receive this before Patroni has bootstrapped; the live
+            # REST reload would hit a closed :8008 and crash the hook. The new hosts are
+            # already on disk via update_config(), so Patroni picks them up when it starts.
+            if self._patroni.member_started:
+                self._patroni.reload_patroni_configuration()
+
+    def _set_dcs_blocked_status(self) -> None:
+        """Block the unit when an etcd-backed cluster loses its DCS relation/cert."""
+        if self.dcs.is_etcd:
+            self.set_unit_status(BlockedStatus("etcd DCS relation required"))
+
+    @property
+    def _etcd_relation_present(self) -> bool:
+        return self.model.get_relation(ETCD_RELATION) is not None
+
+    @property
+    def _etcd_cert_relation_present(self) -> bool:
+        return self.model.get_relation(ETCD_CLIENT_CERTIFICATES_RELATION) is not None
+
+    def _dcs_ready_to_bootstrap(self) -> bool:
+        """Gate Patroni bootstrap on DCS readiness.
+
+        Raft (no etcd relation) is always ready. With an etcd relation, the etcd
+        client cert is mandatory and etcd must have published endpoints/CA/username.
+        """
+        if not self._etcd_relation_present:
+            return True
+        if not self._etcd_cert_relation_present:
+            self.set_unit_status(
+                BlockedStatus("etcd-client-certificates relation required for etcd DCS")
+            )
+            return False
+        if not self.etcd.is_ready:
+            self.set_unit_status(WaitingStatus("waiting for etcd DCS"))
+            return False
+        # Ensure the etcd TLS files exist before Patroni reads them.
+        self.etcd.write_tls_files()
+        return True
+
+    def _record_active_dcs_backend(self) -> None:
+        """Leader records the DCS backend chosen at bootstrap (etcd when related)."""
+        if not self.unit.is_leader():
+            return
+        if self._etcd_relation_present and self.etcd.is_ready:
+            self.app_peer_data[DCS_BACKEND_KEY] = DCS_ETCD
 
 
 if __name__ == "__main__":

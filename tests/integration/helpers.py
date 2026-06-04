@@ -537,6 +537,28 @@ async def execute_query_on_unit(
     return output
 
 
+async def write_query_on_unit(
+    unit_address: str,
+    password: str,
+    query: str,
+    database: str = DATABASE_DEFAULT_NAME,
+    sslmode: str | None = None,
+) -> None:
+    """Execute a write/DDL PostgreSQL query (one with no result set) on a unit.
+
+    The companion ``execute_query_on_unit`` always fetches rows, so it cannot run
+    INSERT/CREATE statements; use this for those.
+    """
+    extra_connection_parameters = f"sslmode={sslmode}" if sslmode else ""
+    with psycopg2.connect(
+        f"dbname='{database}' user='operator' host='{unit_address}' "
+        f"password='{password}' connect_timeout=10 {extra_connection_parameters}"
+    ) as connection:
+        connection.autocommit = True
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+
+
 async def find_unit(ops_test: OpsTest, application: str, leader: bool) -> Unit:
     """Helper function that retrieves a unit, based on need for leader or non-leader.
 

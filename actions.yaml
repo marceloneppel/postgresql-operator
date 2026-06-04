@@ -97,3 +97,12 @@ restore:
     restore-to-time:
       type: string
       description: Point-in-time-recovery target in PSQL format.
+migrate-dcs-to-etcd:
+  description: |
+    Migrate this PostgreSQL cluster's Patroni DCS from the deprecated Raft backend to etcd.
+
+    Requires an active `etcd` relation and an `etcd-client-certificates` relation whose
+    certificate CN matches the etcd-granted username. Causes a brief, controlled write
+    interruption while the cluster is repointed leader-first. Rolls back automatically to
+    Raft on any failure before the commit step.
+  additionalProperties: false

@@ -72,6 +72,17 @@ def harness():
     harness.cleanup()
 
 
+def test_charm_instantiates_dcs_and_etcd(harness):
+    """The charm exposes the DCS seam and etcd relation handler."""
+    from dcs import DCSBackend
+    from relations.etcd import PostgreSQLEtcd
+
+    assert isinstance(harness.charm.dcs, DCSBackend)
+    assert isinstance(harness.charm.etcd, PostgreSQLEtcd)
+    # Default backend is raft until an etcd relation flips it.
+    assert harness.charm.dcs.is_raft is True
+
+
 def test_config_fallback(harness):
     """Test that config options with dashes (-) override config options with underscores (_)."""
     harness.disable_hooks()
@@ -1898,6 +1909,28 @@ def test_on_peer_relation_changed(harness):
         _coordinate_stanza_fields.assert_called_once()
 
 
+def test_on_peer_relation_changed_defers_to_migration_reactor(harness):
+    with (
+        patch.object(harness.charm, "migration") as _migration,
+        patch("charm.PostgresqlOperatorCharm._peer_relation_changed_checks") as _checks,
+    ):
+        _migration.reconcile.return_value = True
+        harness.charm._on_peer_relation_changed(Mock())
+        _migration.reconcile.assert_called_once()
+        _checks.assert_not_called()
+
+
+def test_on_update_status_defers_to_migration_reactor(harness):
+    with (
+        patch.object(harness.charm, "migration") as _migration,
+        patch("charm.PostgresqlOperatorCharm._can_run_on_update_status") as _can_run,
+    ):
+        _migration.reconcile.return_value = True
+        harness.charm._on_update_status(None)
+        _migration.reconcile.assert_called_once()
+        _can_run.assert_not_called()
+
+
 def test_reconfigure_cluster(harness):
     with (
         patch("charm.PostgresqlOperatorCharm._add_members") as _add_members,
@@ -2781,6 +2814,31 @@ def test_set_primary_status_message(harness, is_leader):
                 assert isinstance(harness.charm.unit.status, MaintenanceStatus)
 
 
+def test_set_primary_status_message_etcd_skips_read_only(harness):
+    """On etcd a healthy primary is never labelled read-only despite an absent Raft."""
+    with (
+        patch("charm.Patroni.has_raft_quorum", return_value=False),
+        patch("charm.Patroni.get_running_cluster_members", return_value=["test"]),
+        patch(
+            "charm.PostgresqlOperatorCharm.is_standby_leader", new_callable=PropertyMock
+        ) as _is_standby_leader,
+        patch("charm.Patroni.get_primary", return_value=harness.charm.unit.name),
+        patch("charm.DCSBackend.is_raft", new_callable=PropertyMock) as _is_raft,
+    ):
+        _is_standby_leader.return_value = False
+
+        # etcd backend: the Raft quorum probe is skipped, so no "(read-only)" suffix.
+        _is_raft.return_value = False
+        harness.charm._set_primary_status_message()
+        assert isinstance(harness.charm.unit.status, ActiveStatus)
+        assert harness.charm.unit.status.message == "Primary"
+
+        # Raft backend: the same quorum loss still surfaces the read-only danger state.
+        _is_raft.return_value = True
+        harness.charm._set_primary_status_message()
+        assert harness.charm.unit.status.message == "Primary (read-only)"
+
+
 def test_override_patroni_restart_condition(harness):
     with (
         patch("charm.Patroni.update_patroni_restart_condition") as _update_restart_condition,
@@ -3541,3 +3599,153 @@ def test_update_config_integrates_all_worker_configs(harness):
         assert worker_configs["max_logical_replication_workers"] == "12"
         assert worker_configs["max_sync_workers_per_subscription"] == "6"
         assert worker_configs["max_parallel_apply_workers_per_subscription"] == "10"
+
+
+def test_etcd_relations_declared():
+    """The charm declares the etcd and etcd-client-certificates requires endpoints."""
+    import yaml
+
+    with open("metadata.yaml") as f:
+        meta = yaml.safe_load(f)
+    requires = meta["requires"]
+    assert requires["etcd"]["interface"] == "etcd_client"
+    assert requires["etcd"]["limit"] == 1
+    assert requires["etcd"]["optional"] is True
+    assert requires["etcd-client-certificates"]["interface"] == "tls-certificates"
+    assert requires["etcd-client-certificates"]["limit"] == 1
+    assert requires["etcd-client-certificates"]["optional"] is True
+
+
+def test_dcs_bootstrap_gate_waits_for_etcd(harness):
+    """With an etcd relation present but not ready, start is gated (waiting)."""
+    from unittest.mock import PropertyMock, patch
+
+    from ops import WaitingStatus
+
+    with (
+        patch(
+            "relations.etcd.PostgreSQLEtcd.is_ready", new_callable=PropertyMock, return_value=False
+        ),
+        patch(
+            "charm.PostgresqlOperatorCharm._etcd_relation_present",
+            new_callable=PropertyMock,
+            return_value=True,
+        ),
+        patch(
+            "charm.PostgresqlOperatorCharm._etcd_cert_relation_present",
+            new_callable=PropertyMock,
+            return_value=True,
+        ),
+    ):
+        assert harness.charm._dcs_ready_to_bootstrap() is False
+        assert isinstance(harness.charm.unit.status, WaitingStatus)
+
+
+def test_dcs_bootstrap_gate_blocks_without_cert(harness):
+    """Etcd related but the client-cert relation is missing -> blocked (mTLS mandatory)."""
+    from unittest.mock import PropertyMock, patch
+
+    from ops import BlockedStatus
+
+    with (
+        patch(
+            "charm.PostgresqlOperatorCharm._etcd_relation_present",
+            new_callable=PropertyMock,
+            return_value=True,
+        ),
+        patch(
+            "charm.PostgresqlOperatorCharm._etcd_cert_relation_present",
+            new_callable=PropertyMock,
+            return_value=False,
+        ),
+    ):
+        assert harness.charm._dcs_ready_to_bootstrap() is False
+        assert isinstance(harness.charm.unit.status, BlockedStatus)
+
+
+def test_dcs_bootstrap_gate_open_without_etcd_relation(harness):
+    """No etcd relation -> gate is open (Raft path, unchanged)."""
+    from unittest.mock import PropertyMock, patch
+
+    with patch(
+        "charm.PostgresqlOperatorCharm._etcd_relation_present",
+        new_callable=PropertyMock,
+        return_value=False,
+    ):
+        assert harness.charm._dcs_ready_to_bootstrap() is True
+
+
+def test_leader_marks_etcd_backend_on_bootstrap(harness):
+    """Leader records the etcd backend key in app peer data on fresh bootstrap."""
+    from unittest.mock import PropertyMock, patch
+
+    from src.constants import DCS_BACKEND_KEY, DCS_ETCD
+
+    with patch("charm.PostgresqlOperatorCharm._on_leader_elected"):
+        harness.set_leader(True)
+    with (
+        patch(
+            "charm.PostgresqlOperatorCharm._etcd_relation_present",
+            new_callable=PropertyMock,
+            return_value=True,
+        ),
+        patch(
+            "relations.etcd.PostgreSQLEtcd.is_ready",
+            new_callable=PropertyMock,
+            return_value=True,
+        ),
+    ):
+        harness.charm._record_active_dcs_backend()
+    assert harness.charm.app_peer_data.get(DCS_BACKEND_KEY) == DCS_ETCD
+
+
+def test_etcd_endpoints_changed_skips_reload_before_member_started(harness):
+    """A fresh unit must re-render config but skip the live Patroni reload.
+
+    The endpoints-changed hook can fire before Patroni has bootstrapped; a live REST
+    reload would hit a closed :8008, crash the hook, and deadlock the unit.
+    """
+    from unittest.mock import PropertyMock, patch
+
+    with (
+        patch("relations.etcd.PostgreSQLEtcd.write_tls_files", return_value=True),
+        patch("charm.PostgresqlOperatorCharm.update_config") as _update_config,
+        patch("charm.Patroni.member_started", new_callable=PropertyMock, return_value=False),
+        patch("charm.Patroni.reload_patroni_configuration") as _reload,
+    ):
+        harness.charm._on_etcd_endpoints_changed(None)
+
+    _update_config.assert_called_once()
+    _reload.assert_not_called()
+
+
+def test_etcd_endpoints_changed_reloads_when_member_started(harness):
+    """When Patroni is already running, an endpoints change triggers a live reload."""
+    from unittest.mock import PropertyMock, patch
+
+    with (
+        patch("relations.etcd.PostgreSQLEtcd.write_tls_files", return_value=True),
+        patch("charm.PostgresqlOperatorCharm.update_config"),
+        patch("charm.Patroni.member_started", new_callable=PropertyMock, return_value=True),
+        patch("charm.Patroni.reload_patroni_configuration") as _reload,
+    ):
+        harness.charm._on_etcd_endpoints_changed(None)
+
+    _reload.assert_called_once()
+
+
+def test_migrate_action_declared():
+    import yaml
+
+    with open("actions.yaml") as f:
+        actions = yaml.safe_load(f)
+    assert "migrate-dcs-to-etcd" in actions
+
+
+def test_migrate_action_refused_when_not_leader(harness):
+    from unittest.mock import MagicMock
+
+    harness.set_leader(False)
+    event = MagicMock()
+    harness.charm._on_migrate_dcs_to_etcd(event)
+    event.fail.assert_called_once()

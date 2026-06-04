@@ -714,6 +714,7 @@ class Patroni:
             watcher=self.charm.watcher_offer.watcher_raft_address
             if self.charm.watcher_offer.is_active
             else None,
+            **self.charm.dcs.template_vars(),
         )
         render_file(Substrates.VM, f"{PATRONI_CONF_PATH}/patroni.yaml", rendered, 0o600)
 
@@ -826,6 +827,25 @@ class Patroni:
             logger.warning(f"Switchover call failed with code {r.status_code} {r.text}")
             raise SwitchoverFailedError(f"received {r.status_code}")
 
+    def _set_pause(self, paused: bool) -> None:
+        r = requests.patch(
+            f"{self._patroni_url}/config",
+            json={"pause": paused},
+            verify=self.verify,
+            auth=self._patroni_auth,
+            timeout=PATRONI_TIMEOUT,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Patroni pause={paused} failed: {r.status_code} {r.text}")
+
+    def pause(self) -> None:
+        """Enter cluster-wide maintenance mode (disable automated failover)."""
+        self._set_pause(True)
+
+    def resume(self) -> None:
+        """Leave maintenance mode (re-enable automated failover)."""
+        self._set_pause(False)
+
     @retry(
         retry=retry_if_result(lambda x: not x),
         stop=stop_after_attempt(10),
@@ -864,6 +884,11 @@ class Patroni:
                     if proc.name() == "postgres":
                         raise RaftPostgresqlStillUpError()
 
+        self.remove_raft_journals()
+        logger.info("Raft ready to reinitialise")
+
+    def remove_raft_journals(self) -> None:
+        """Delete the on-disk Raft journals, leaving Patroni running."""
         logger.info("Removing raft data")
         try:
             path = Path(f"{PATRONI_CONF_PATH}/raft")
@@ -873,7 +898,18 @@ class Patroni:
             raise Exception(
                 f"Failed to remove previous cluster information with error: {e!s}"
             ) from e
-        logger.info("Raft ready to reinitialise")
+
+    def remove_dynamic_config_cache(self) -> None:
+        """Delete Patroni's cached dynamic config so a fresh-DCS bootstrap stays unpaused.
+
+        Patroni caches the DCS dynamic config (including ``pause``) to ``patroni.dynamic.json``
+        in the data dir. Bootstrapping an empty keyspace it restores that cache, so a cached
+        ``pause: true`` (set while migrating off Raft) makes it come up in maintenance mode and
+        never bootstrap -- it never writes ``/config``, so unpausing via the REST API is then
+        impossible (``PATCH /config`` 503s forever). Removing the cache forces it to take the
+        unpaused ``bootstrap.dcs`` config from ``patroni.yaml`` instead.
+        """
+        Path(f"{POSTGRESQL_DATA_PATH}/patroni.dynamic.json").unlink(missing_ok=True)
 
     def reinitialise_raft_data(self) -> None:
         """Reinitialise the raft journals and promoting the unit to leader. Should only be run on sync replicas."""
@@ -1170,11 +1206,15 @@ class Patroni:
     @cached_property
     def synchronous_configuration(self) -> dict[str, Any]:
         """Synchronous mode configuration."""
-        # Try to update synchronous_node_count.
+        # Only enforce strict synchronous mode once the membership list holds at least
+        # synchronous_node_count replicas (members = leader + replicas, so members must
+        # exceed the count). Enforcing it earlier -- e.g. while members are still being
+        # added one at a time during bootstrap -- pins Patroni to more synchronous
+        # standbys than exist, blocking every primary write and deadlocking the cluster.
         member_units = json.loads(self.charm.app_peer_data.get("members_ips", "[]"))
         return {
             "synchronous_node_count": self._synchronous_node_count,
-            "synchronous_mode_strict": len(member_units) > 1
+            "synchronous_mode_strict": len(member_units) > self._synchronous_node_count
             and self.charm.config.synchronous_mode_strict
             and self._synchronous_node_count > 0,
         }
